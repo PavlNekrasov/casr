@@ -10,6 +10,10 @@ use reqwest::header::{AUTHORIZATION, HeaderMap};
 use reqwest::{Client, Method, RequestBuilder, Response, Url};
 use walkdir::WalkDir;
 
+use lettre::{Message, SmtpTransport, Transport, transport::smtp::authentication::Credentials};
+use secrecy::{Secret, ExposeSecret};
+use std::env;
+
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -221,7 +225,7 @@ impl DefectDojoClient {
         extra_gdb_report: bool,
         product_name: String,
         test_id: i64,
-    ) -> Result<()> {
+    ) -> Result<FindingInfo> {
         // Create new finding.
         let mut executable = "";
         if let Some(fname) = Path::new(&report.executable_path).file_name() {
@@ -366,7 +370,11 @@ impl DefectDojoClient {
             debug!("Uploaded crash seed for finding '{}' with id={}", title, id);
         }
 
-        Ok(())
+        Ok(FindingInfo {
+            title,
+            severity: severity.to_string(),
+            id,
+        })
     }
 }
 
@@ -551,6 +559,133 @@ fn get_report_description(
     d += "\n```\n";
     d
 }
+
+struct FindingInfo {
+    title: String,
+    severity: String,
+    id: i64,
+}
+
+struct MailConfig{
+    host: String,
+    port: u16,
+    email: String,
+    password: Secret<String>,
+    recipients: Vec<String>,
+    defectdojo_url: String,
+}
+
+
+impl MailConfig {
+
+    pub fn new(toml: toml::Table, defectdojo_url: String) -> Result<Option<Self>> {
+        if !toml.contains_key("mail_settings") || !toml["mail_settings"].is_table() {
+            return Ok(None);
+        }
+
+        let mail_settings = toml["mail_settings"].as_table().unwrap();
+
+        // Проверка обязательных полей
+        if !mail_settings.contains_key("host") || !mail_settings["host"].is_str() {
+            bail!("[mail_settings] host (string) must be specified in TOML");
+        }
+        if !mail_settings.contains_key("port") || !mail_settings["port"].is_integer() {
+            bail!("[mail_settings] port (integer) must be specified in TOML");
+        }
+        if !mail_settings.contains_key("email") || !mail_settings["email"].is_str() {
+            bail!("[mail_settings] email (string) must be specified in TOML");
+        }
+        if !mail_settings.contains_key("password") || !mail_settings["password"].is_str() {
+            bail!("[mail_settings] password (string) must be specified in TOML");
+        }
+        if !mail_settings.contains_key("recipients") || !mail_settings["recipients"].is_array() {
+            bail!("[mail_settings] recipients (array) must be specified in TOML");
+        }
+
+        if let Some(recipients) = mail_settings["recipients"].as_array() {
+            for recipient in recipients {
+                if !recipient.is_str() {
+                    bail!("All elements in [mail_settings] recipients must be strings");
+                }
+            }
+        }
+
+        let host = mail_settings["host"].as_str().unwrap().to_string();
+        let port = mail_settings["port"].as_integer().unwrap() as u16;
+        let email = mail_settings["email"].as_str().unwrap().to_string();
+
+        let password = mail_settings["password"].as_str().unwrap().to_string();
+
+        let password = if password.starts_with("${") && password.ends_with('}') {
+            env::var(&password[2..password.len()-1]).unwrap()
+        } else {
+            password
+        };
+        let password = Secret::new(password);
+
+        let recipients = mail_settings["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        Ok(Some(Self {
+            host,
+            port,
+            email,
+            password,
+            recipients,
+            defectdojo_url,
+        }))
+    }
+
+    fn create_transport(&self) -> Result<SmtpTransport> {
+        let creds = Credentials::new(self.email.clone(), self.password.expose_secret().clone());
+        let mailer = SmtpTransport::relay(&self.host)?
+            .credentials(creds)
+            .port(self.port)
+            .build();
+        Ok(mailer)
+    }
+
+    pub async fn send_notification(&self, product_name: &str, findings: &[FindingInfo]) -> Result<()> {
+        if findings.is_empty() {
+            return Ok(());
+        }
+        
+        let transport = self.create_transport()?;
+        let subject = format!("[DefectDojo] {} new findings for {}", findings.len(), product_name);
+    
+        let mut body = format!("New findings uploaded to DefectDojo for '{}':\n\n", product_name);
+    
+        for finding in findings {
+            let finding_url = format!("{}/finding/{}", self.defectdojo_url, finding.id);
+            body.push_str(&format!(
+                "- {} (Severity: {})\n  View: {}\n\n",
+                finding.title, finding.severity, finding_url
+            ));
+        }
+    
+        let mut email_builder = Message::builder()
+            .from(self.email.parse()?);
+        
+        for recipient in &self.recipients {
+            email_builder = email_builder.to(recipient.parse()?);
+        }
+        
+        let email = email_builder.subject(subject).body(body)?;
+    
+        transport.send(&email)?;
+        info!(
+            "Summary email notification sent to {} recipients: {}",
+            self.recipients.len(),
+            self.recipients.join(", ")
+        );        Ok(())
+    }
+
+}
+
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -896,6 +1031,7 @@ async fn main() -> Result<()> {
     let extra_gdb_report = new_casr_reports.iter().any(|(_, _, gdb)| gdb.is_some());
     let mut tasks = tokio::task::JoinSet::new();
     let mut new_casr_reports = new_casr_reports.into_iter();
+    let mut findings = Vec::new();
     loop {
         while tasks.len() < CONCURRENCY_LIMIT {
             let Some((path, report, gdb)) = new_casr_reports.next() else {
@@ -911,10 +1047,32 @@ async fn main() -> Result<()> {
         let Some(r) = tasks.join_next().await else {
             break;
         };
-        if let Err(e) = r? {
-            error!("{}", e);
+        match r? {
+            Ok(finding) => {
+                findings.push(finding);
+            }
+            Err(e) => {
+                error!("{}", e);
+            }
         }
     }
+    
+    let mail_sender = match MailConfig::new(toml.clone(), options.get_one::<Url>("url").unwrap().to_string()) {
+        Ok(Some(config)) => config, 
+        Ok(None) => {
+            warn!("Mail configuration not found in TOML, skipping notifications");
+            return Ok(());
+        }
+        Err(e) => {
+            error!("Failed to parse mail config: {}", e);
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = mail_sender.send_notification(&product_name.to_string(), &findings).await {
+        error!("Failed to send notification: {}", e);
+    }
+
 
     Ok(())
 }
