@@ -25,7 +25,7 @@ use gdb_command::*;
 use regex::Regex;
 
 use std::env;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::Command;
 
